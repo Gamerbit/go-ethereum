@@ -4,6 +4,7 @@
 # or operating system, you probably want to add a global ignore instead:
 #   git config --global core.excludesfile ~/.gitignore_global
 
+
 /tmp
 */**/*un~
 */**/*.test
@@ -14,6 +15,7 @@
 */**/*tx_database*
 */**/*dapps*
 build/_vendor/pkg
+
 
 #*
 .#*
