@@ -1,4 +1,4 @@
-## Go Ethereum
+## Go Ethereum - gbits.io
 
 Official golang implementation of the Ethereum protocol.
 
