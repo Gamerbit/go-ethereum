@@ -24,16 +24,16 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 )
 
 func makeReceipt(addr common.Address) *types.Receipt {
-	receipt := types.NewReceipt(nil, new(big.Int))
+	receipt := types.NewReceipt(nil, false, 0)
 	receipt.Logs = []*types.Log{
 		{Address: addr},
 	}
@@ -41,17 +41,16 @@ func makeReceipt(addr common.Address) *types.Receipt {
 	return receipt
 }
 
-func BenchmarkMipmaps(b *testing.B) {
-	dir, err := ioutil.TempDir("", "mipmap")
+func BenchmarkFilters(b *testing.B) {
+	dir, err := ioutil.TempDir("", "filtertest")
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
 	var (
-		db, _   = ethdb.NewLDBDatabase(dir, 0, 0)
-		mux     = new(event.TypeMux)
-		backend = &testBackend{mux, db}
+		db, _   = rawdb.NewLevelDBDatabase(dir, 0, 0, "", false)
+		backend = &testBackend{db: db}
 		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
 		addr2   = common.BytesToAddress([]byte("jeff"))
@@ -61,50 +60,35 @@ func BenchmarkMipmaps(b *testing.B) {
 	defer db.Close()
 
 	genesis := core.GenesisBlockForTesting(db, addr1, big.NewInt(1000000))
-	chain, receipts := core.GenerateChain(params.TestChainConfig, genesis, db, 100010, func(i int, gen *core.BlockGen) {
-		var receipts types.Receipts
+	chain, receipts := core.GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), db, 100010, func(i int, gen *core.BlockGen) {
 		switch i {
 		case 2403:
 			receipt := makeReceipt(addr1)
-			receipts = types.Receipts{receipt}
 			gen.AddUncheckedReceipt(receipt)
 		case 1034:
 			receipt := makeReceipt(addr2)
-			receipts = types.Receipts{receipt}
 			gen.AddUncheckedReceipt(receipt)
 		case 34:
 			receipt := makeReceipt(addr3)
-			receipts = types.Receipts{receipt}
 			gen.AddUncheckedReceipt(receipt)
 		case 99999:
 			receipt := makeReceipt(addr4)
-			receipts = types.Receipts{receipt}
 			gen.AddUncheckedReceipt(receipt)
 
 		}
-		core.WriteMipmapBloom(db, uint64(i+1), receipts)
 	})
 	for i, block := range chain {
-		core.WriteBlock(db, block)
-		if err := core.WriteCanonicalHash(db, block.Hash(), block.NumberU64()); err != nil {
-			b.Fatalf("failed to insert block number: %v", err)
-		}
-		if err := core.WriteHeadBlockHash(db, block.Hash()); err != nil {
-			b.Fatalf("failed to insert block number: %v", err)
-		}
-		if err := core.WriteBlockReceipts(db, block.Hash(), block.NumberU64(), receipts[i]); err != nil {
-			b.Fatal("error writing block receipts:", err)
-		}
+		rawdb.WriteBlock(db, block)
+		rawdb.WriteCanonicalHash(db, block.Hash(), block.NumberU64())
+		rawdb.WriteHeadBlockHash(db, block.Hash())
+		rawdb.WriteReceipts(db, block.Hash(), block.NumberU64(), receipts[i])
 	}
 	b.ResetTimer()
 
-	filter := New(backend, true)
-	filter.SetAddresses([]common.Address{addr1, addr2, addr3, addr4})
-	filter.SetBeginBlock(0)
-	filter.SetEndBlock(-1)
+	filter := NewRangeFilter(backend, 0, -1, []common.Address{addr1, addr2, addr3, addr4}, nil)
 
 	for i := 0; i < b.N; i++ {
-		logs, _ := filter.Find(context.Background())
+		logs, _ := filter.Logs(context.Background())
 		if len(logs) != 4 {
 			b.Fatal("expected 4 logs, got", len(logs))
 		}
@@ -112,16 +96,15 @@ func BenchmarkMipmaps(b *testing.B) {
 }
 
 func TestFilters(t *testing.T) {
-	dir, err := ioutil.TempDir("", "mipmap")
+	dir, err := ioutil.TempDir("", "filtertest")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
 	var (
-		db, _   = ethdb.NewLDBDatabase(dir, 0, 0)
-		mux     = new(event.TypeMux)
-		backend = &testBackend{mux, db}
+		db, _   = rawdb.NewLevelDBDatabase(dir, 0, 0, "", false)
+		backend = &testBackend{db: db}
 		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		addr    = crypto.PubkeyToAddress(key1.PublicKey)
 
@@ -133,11 +116,10 @@ func TestFilters(t *testing.T) {
 	defer db.Close()
 
 	genesis := core.GenesisBlockForTesting(db, addr, big.NewInt(1000000))
-	chain, receipts := core.GenerateChain(params.TestChainConfig, genesis, db, 1000, func(i int, gen *core.BlockGen) {
-		var receipts types.Receipts
+	chain, receipts := core.GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), db, 1000, func(i int, gen *core.BlockGen) {
 		switch i {
 		case 1:
-			receipt := types.NewReceipt(nil, new(big.Int))
+			receipt := types.NewReceipt(nil, false, 0)
 			receipt.Logs = []*types.Log{
 				{
 					Address: addr,
@@ -145,9 +127,9 @@ func TestFilters(t *testing.T) {
 				},
 			}
 			gen.AddUncheckedReceipt(receipt)
-			receipts = types.Receipts{receipt}
+			gen.AddUncheckedTx(types.NewTransaction(1, common.HexToAddress("0x1"), big.NewInt(1), 1, big.NewInt(1), nil))
 		case 2:
-			receipt := types.NewReceipt(nil, new(big.Int))
+			receipt := types.NewReceipt(nil, false, 0)
 			receipt.Logs = []*types.Log{
 				{
 					Address: addr,
@@ -155,9 +137,10 @@ func TestFilters(t *testing.T) {
 				},
 			}
 			gen.AddUncheckedReceipt(receipt)
-			receipts = types.Receipts{receipt}
+			gen.AddUncheckedTx(types.NewTransaction(2, common.HexToAddress("0x2"), big.NewInt(2), 2, big.NewInt(2), nil))
+
 		case 998:
-			receipt := types.NewReceipt(nil, new(big.Int))
+			receipt := types.NewReceipt(nil, false, 0)
 			receipt.Logs = []*types.Log{
 				{
 					Address: addr,
@@ -165,9 +148,9 @@ func TestFilters(t *testing.T) {
 				},
 			}
 			gen.AddUncheckedReceipt(receipt)
-			receipts = types.Receipts{receipt}
+			gen.AddUncheckedTx(types.NewTransaction(998, common.HexToAddress("0x998"), big.NewInt(998), 998, big.NewInt(998), nil))
 		case 999:
-			receipt := types.NewReceipt(nil, new(big.Int))
+			receipt := types.NewReceipt(nil, false, 0)
 			receipt.Logs = []*types.Log{
 				{
 					Address: addr,
@@ -175,43 +158,25 @@ func TestFilters(t *testing.T) {
 				},
 			}
 			gen.AddUncheckedReceipt(receipt)
-			receipts = types.Receipts{receipt}
+			gen.AddUncheckedTx(types.NewTransaction(999, common.HexToAddress("0x999"), big.NewInt(999), 999, big.NewInt(999), nil))
 		}
-		// i is used as block number for the writes but since the i
-		// starts at 0 and block 0 (genesis) is already present increment
-		// by one
-		core.WriteMipmapBloom(db, uint64(i+1), receipts)
 	})
 	for i, block := range chain {
-		core.WriteBlock(db, block)
-		if err := core.WriteCanonicalHash(db, block.Hash(), block.NumberU64()); err != nil {
-			t.Fatalf("failed to insert block number: %v", err)
-		}
-		if err := core.WriteHeadBlockHash(db, block.Hash()); err != nil {
-			t.Fatalf("failed to insert block number: %v", err)
-		}
-		if err := core.WriteBlockReceipts(db, block.Hash(), block.NumberU64(), receipts[i]); err != nil {
-			t.Fatal("error writing block receipts:", err)
-		}
+		rawdb.WriteBlock(db, block)
+		rawdb.WriteCanonicalHash(db, block.Hash(), block.NumberU64())
+		rawdb.WriteHeadBlockHash(db, block.Hash())
+		rawdb.WriteReceipts(db, block.Hash(), block.NumberU64(), receipts[i])
 	}
 
-	filter := New(backend, true)
-	filter.SetAddresses([]common.Address{addr})
-	filter.SetTopics([][]common.Hash{{hash1, hash2, hash3, hash4}})
-	filter.SetBeginBlock(0)
-	filter.SetEndBlock(-1)
+	filter := NewRangeFilter(backend, 0, -1, []common.Address{addr}, [][]common.Hash{{hash1, hash2, hash3, hash4}})
 
-	logs, _ := filter.Find(context.Background())
+	logs, _ := filter.Logs(context.Background())
 	if len(logs) != 4 {
 		t.Error("expected 4 log, got", len(logs))
 	}
 
-	filter = New(backend, true)
-	filter.SetAddresses([]common.Address{addr})
-	filter.SetTopics([][]common.Hash{{hash3}})
-	filter.SetBeginBlock(900)
-	filter.SetEndBlock(999)
-	logs, _ = filter.Find(context.Background())
+	filter = NewRangeFilter(backend, 900, 999, []common.Address{addr}, [][]common.Hash{{hash3}})
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 1 {
 		t.Error("expected 1 log, got", len(logs))
 	}
@@ -219,12 +184,8 @@ func TestFilters(t *testing.T) {
 		t.Errorf("expected log[0].Topics[0] to be %x, got %x", hash3, logs[0].Topics[0])
 	}
 
-	filter = New(backend, true)
-	filter.SetAddresses([]common.Address{addr})
-	filter.SetTopics([][]common.Hash{{hash3}})
-	filter.SetBeginBlock(990)
-	filter.SetEndBlock(-1)
-	logs, _ = filter.Find(context.Background())
+	filter = NewRangeFilter(backend, 990, -1, []common.Address{addr}, [][]common.Hash{{hash3}})
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 1 {
 		t.Error("expected 1 log, got", len(logs))
 	}
@@ -232,44 +193,32 @@ func TestFilters(t *testing.T) {
 		t.Errorf("expected log[0].Topics[0] to be %x, got %x", hash3, logs[0].Topics[0])
 	}
 
-	filter = New(backend, true)
-	filter.SetTopics([][]common.Hash{{hash1, hash2}})
-	filter.SetBeginBlock(1)
-	filter.SetEndBlock(10)
+	filter = NewRangeFilter(backend, 1, 10, nil, [][]common.Hash{{hash1, hash2}})
 
-	logs, _ = filter.Find(context.Background())
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 2 {
 		t.Error("expected 2 log, got", len(logs))
 	}
 
 	failHash := common.BytesToHash([]byte("fail"))
-	filter = New(backend, true)
-	filter.SetTopics([][]common.Hash{{failHash}})
-	filter.SetBeginBlock(0)
-	filter.SetEndBlock(-1)
+	filter = NewRangeFilter(backend, 0, -1, nil, [][]common.Hash{{failHash}})
 
-	logs, _ = filter.Find(context.Background())
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 0 {
 		t.Error("expected 0 log, got", len(logs))
 	}
 
 	failAddr := common.BytesToAddress([]byte("failmenow"))
-	filter = New(backend, true)
-	filter.SetAddresses([]common.Address{failAddr})
-	filter.SetBeginBlock(0)
-	filter.SetEndBlock(-1)
+	filter = NewRangeFilter(backend, 0, -1, []common.Address{failAddr}, nil)
 
-	logs, _ = filter.Find(context.Background())
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 0 {
 		t.Error("expected 0 log, got", len(logs))
 	}
 
-	filter = New(backend, true)
-	filter.SetTopics([][]common.Hash{{failHash}, {hash1}})
-	filter.SetBeginBlock(0)
-	filter.SetEndBlock(-1)
+	filter = NewRangeFilter(backend, 0, -1, nil, [][]common.Hash{{failHash}, {hash1}})
 
-	logs, _ = filter.Find(context.Background())
+	logs, _ = filter.Logs(context.Background())
 	if len(logs) != 0 {
 		t.Error("expected 0 log, got", len(logs))
 	}

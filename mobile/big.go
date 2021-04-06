@@ -21,6 +21,8 @@ package geth
 import (
 	"errors"
 	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // A BigInt represents a signed multi-precision integer.
@@ -31,6 +33,16 @@ type BigInt struct {
 // NewBigInt allocates and returns a new BigInt set to x.
 func NewBigInt(x int64) *BigInt {
 	return &BigInt{big.NewInt(x)}
+}
+
+// NewBigIntFromString allocates and returns a new BigInt set to x
+// interpreted in the provided base.
+func NewBigIntFromString(x string, base int) *BigInt {
+	b, success := new(big.Int).SetString(x, base)
+	if !success {
+		return nil
+	}
+	return &BigInt{b}
 }
 
 // GetBytes returns the absolute value of x as a big-endian byte slice.
@@ -52,12 +64,22 @@ func (bi *BigInt) GetInt64() int64 {
 // SetBytes interprets buf as the bytes of a big-endian unsigned integer and sets
 // the big int to that value.
 func (bi *BigInt) SetBytes(buf []byte) {
-	bi.bigint.SetBytes(buf)
+	bi.bigint.SetBytes(common.CopyBytes(buf))
 }
 
 // SetInt64 sets the big int to x.
 func (bi *BigInt) SetInt64(x int64) {
 	bi.bigint.SetInt64(x)
+}
+
+// Sign returns:
+//
+//	-1 if x <  0
+//	 0 if x == 0
+//	+1 if x >  0
+//
+func (bi *BigInt) Sign() int {
+	return bi.bigint.Sign()
 }
 
 // SetString sets the big int to x.
@@ -71,6 +93,13 @@ func (bi *BigInt) SetString(x string, base int) {
 
 // BigInts represents a slice of big ints.
 type BigInts struct{ bigints []*big.Int }
+
+// NewBigInts creates a slice of uninitialized big numbers.
+func NewBigInts(size int) *BigInts {
+	return &BigInts{
+		bigints: make([]*big.Int, size),
+	}
+}
 
 // Size returns the number of big ints in the slice.
 func (bi *BigInts) Size() int {

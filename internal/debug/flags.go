@@ -25,16 +25,25 @@ import (
 	"runtime"
 
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/log/term"
-	colorable "github.com/mattn/go-colorable"
+	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/metrics/exp"
+	"github.com/fjl/memsize/memsizeui"
+	"github.com/mattn/go-colorable"
+	"github.com/mattn/go-isatty"
 	"gopkg.in/urfave/cli.v1"
 )
+
+var Memsize memsizeui.Handler
 
 var (
 	verbosityFlag = cli.IntFlag{
 		Name:  "verbosity",
 		Usage: "Logging verbosity: 0=silent, 1=error, 2=warn, 3=info, 4=debug, 5=detail",
 		Value: 3,
+	}
+	logjsonFlag = cli.BoolFlag{
+		Name:  "log.json",
+		Usage: "Format logs with JSON",
 	}
 	vmoduleFlag = cli.StringFlag{
 		Name:  "vmodule",
@@ -55,26 +64,26 @@ var (
 		Usage: "Enable the pprof HTTP server",
 	}
 	pprofPortFlag = cli.IntFlag{
-		Name:  "pprofport",
+		Name:  "pprof.port",
 		Usage: "pprof HTTP server listening port",
 		Value: 6060,
 	}
 	pprofAddrFlag = cli.StringFlag{
-		Name:  "pprofaddr",
+		Name:  "pprof.addr",
 		Usage: "pprof HTTP server listening interface",
 		Value: "127.0.0.1",
 	}
 	memprofilerateFlag = cli.IntFlag{
-		Name:  "memprofilerate",
+		Name:  "pprof.memprofilerate",
 		Usage: "Turn on memory profiling with the given rate",
 		Value: runtime.MemProfileRate,
 	}
 	blockprofilerateFlag = cli.IntFlag{
-		Name:  "blockprofilerate",
+		Name:  "pprof.blockprofilerate",
 		Usage: "Turn on block profiling with the given rate",
 	}
 	cpuprofileFlag = cli.StringFlag{
-		Name:  "cpuprofile",
+		Name:  "pprof.cpuprofile",
 		Usage: "Write CPU profile to the given file",
 	}
 	traceFlag = cli.StringFlag{
@@ -85,25 +94,36 @@ var (
 
 // Flags holds all command-line flags required for debugging.
 var Flags = []cli.Flag{
-	verbosityFlag, vmoduleFlag, backtraceAtFlag, debugFlag,
-	pprofFlag, pprofAddrFlag, pprofPortFlag,
-	memprofilerateFlag, blockprofilerateFlag, cpuprofileFlag, traceFlag,
+	verbosityFlag, logjsonFlag, vmoduleFlag, backtraceAtFlag, debugFlag,
+	pprofFlag, pprofAddrFlag, pprofPortFlag, memprofilerateFlag,
+	blockprofilerateFlag, cpuprofileFlag, traceFlag,
 }
 
-var glogger *log.GlogHandler
+var (
+	glogger *log.GlogHandler
+)
 
 func init() {
-	usecolor := term.IsTty(os.Stderr.Fd()) && os.Getenv("TERM") != "dumb"
-	output := io.Writer(os.Stderr)
-	if usecolor {
-		output = colorable.NewColorableStderr()
-	}
-	glogger = log.NewGlogHandler(log.StreamHandler(output, log.TerminalFormat(usecolor)))
+	glogger = log.NewGlogHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(false)))
+	glogger.Verbosity(log.LvlInfo)
+	log.Root().SetHandler(glogger)
 }
 
 // Setup initializes profiling and logging based on the CLI flags.
 // It should be called as early as possible in the program.
 func Setup(ctx *cli.Context) error {
+	var ostream log.Handler
+	output := io.Writer(os.Stderr)
+	if ctx.GlobalBool(logjsonFlag.Name) {
+		ostream = log.StreamHandler(output, log.JSONFormat())
+	} else {
+		usecolor := (isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())) && os.Getenv("TERM") != "dumb"
+		if usecolor {
+			output = colorable.NewColorableStderr()
+		}
+		ostream = log.StreamHandler(output, log.TerminalFormat(usecolor))
+	}
+	glogger.SetHandler(ostream)
 	// logging
 	log.PrintOrigins(ctx.GlobalBool(debugFlag.Name))
 	glogger.Verbosity(log.Lvl(ctx.GlobalInt(verbosityFlag.Name)))
@@ -113,12 +133,15 @@ func Setup(ctx *cli.Context) error {
 
 	// profiling, tracing
 	runtime.MemProfileRate = ctx.GlobalInt(memprofilerateFlag.Name)
+
 	Handler.SetBlockProfileRate(ctx.GlobalInt(blockprofilerateFlag.Name))
+
 	if traceFile := ctx.GlobalString(traceFlag.Name); traceFile != "" {
 		if err := Handler.StartGoTrace(traceFile); err != nil {
 			return err
 		}
 	}
+
 	if cpuFile := ctx.GlobalString(cpuprofileFlag.Name); cpuFile != "" {
 		if err := Handler.StartCPUProfile(cpuFile); err != nil {
 			return err
@@ -127,15 +150,31 @@ func Setup(ctx *cli.Context) error {
 
 	// pprof server
 	if ctx.GlobalBool(pprofFlag.Name) {
-		address := fmt.Sprintf("%s:%d", ctx.GlobalString(pprofAddrFlag.Name), ctx.GlobalInt(pprofPortFlag.Name))
-		go func() {
-			log.Info("Starting pprof server", "addr", fmt.Sprintf("http://%s/debug/pprof", address))
-			if err := http.ListenAndServe(address, nil); err != nil {
-				log.Error("Failure in running pprof server", "err", err)
-			}
-		}()
+		listenHost := ctx.GlobalString(pprofAddrFlag.Name)
+
+		port := ctx.GlobalInt(pprofPortFlag.Name)
+
+		address := fmt.Sprintf("%s:%d", listenHost, port)
+		// This context value ("metrics.addr") represents the utils.MetricsHTTPFlag.Name.
+		// It cannot be imported because it will cause a cyclical dependency.
+		StartPProf(address, !ctx.GlobalIsSet("metrics.addr"))
 	}
 	return nil
+}
+
+func StartPProf(address string, withMetrics bool) {
+	// Hook go-metrics into expvar on any /debug/metrics request, load all vars
+	// from the registry into expvar, and execute regular expvar handler.
+	if withMetrics {
+		exp.Exp(metrics.DefaultRegistry)
+	}
+	http.Handle("/memsize/", http.StripPrefix("/memsize", &Memsize))
+	log.Info("Starting pprof server", "addr", fmt.Sprintf("http://%s/debug/pprof", address))
+	go func() {
+		if err := http.ListenAndServe(address, nil); err != nil {
+			log.Error("Failure in running pprof server", "err", err)
+		}
+	}()
 }
 
 // Exit stops all running profiles, flushing their output to the

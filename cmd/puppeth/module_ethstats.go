@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -30,21 +31,9 @@ import (
 // ethstatsDockerfile is the Dockerfile required to build an ethstats backend
 // and associated monitoring site.
 var ethstatsDockerfile = `
-FROM mhart/alpine-node:latest
+FROM puppeth/ethstats:latest
 
-RUN \
-  apk add --update git                                         && \
-  git clone --depth=1 https://github.com/karalabe/eth-netstats && \
-	apk del git && rm -rf /var/cache/apk/*                       && \
-	\
-  cd /eth-netstats && npm install && npm install -g grunt-cli && grunt
-
-WORKDIR /eth-netstats
-EXPOSE 3000
-
-RUN echo 'module.exports = {trusted: [{{.Trusted}}], banned: []};' > lib/utils/config.js
-
-CMD ["npm", "start"]
+RUN echo 'module.exports = {trusted: [{{.Trusted}}], banned: [{{.Banned}}], reserved: ["yournode"]};' > lib/utils/config.js
 `
 
 // ethstatsComposefile is the docker-compose.yml file required to deploy and
@@ -54,30 +43,43 @@ version: '2'
 services:
   ethstats:
     build: .
-    image: {{.Network}}/ethstats{{if not .VHost}}
+    image: {{.Network}}/ethstats
+    container_name: {{.Network}}_ethstats_1{{if not .VHost}}
     ports:
       - "{{.Port}}:3000"{{end}}
     environment:
       - WS_SECRET={{.Secret}}{{if .VHost}}
-      - VIRTUAL_HOST={{.VHost}}{{end}}
+      - VIRTUAL_HOST={{.VHost}}{{end}}{{if .Banned}}
+      - BANNED={{.Banned}}{{end}}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "10"
     restart: always
 `
 
 // deployEthstats deploys a new ethstats container to a remote machine via SSH,
 // docker and docker-compose. If an instance with the specified network name
 // already exists there, it will be overwritten!
-func deployEthstats(client *sshClient, network string, port int, secret string, vhost string, trusted []string) ([]byte, error) {
+func deployEthstats(client *sshClient, network string, port int, secret string, vhost string, trusted []string, banned []string, nocache bool) ([]byte, error) {
 	// Generate the content to upload to the server
 	workdir := fmt.Sprintf("%d", rand.Int63())
 	files := make(map[string][]byte)
 
+	trustedLabels := make([]string, len(trusted))
 	for i, address := range trusted {
-		trusted[i] = fmt.Sprintf("\"%s\"", address)
+		trustedLabels[i] = fmt.Sprintf("\"%s\"", address)
+	}
+	bannedLabels := make([]string, len(banned))
+	for i, address := range banned {
+		bannedLabels[i] = fmt.Sprintf("\"%s\"", address)
 	}
 
 	dockerfile := new(bytes.Buffer)
 	template.Must(template.New("").Parse(ethstatsDockerfile)).Execute(dockerfile, map[string]interface{}{
-		"Trusted": strings.Join(trusted, ", "),
+		"Trusted": strings.Join(trustedLabels, ", "),
+		"Banned":  strings.Join(bannedLabels, ", "),
 	})
 	files[filepath.Join(workdir, "Dockerfile")] = dockerfile.Bytes()
 
@@ -87,6 +89,7 @@ func deployEthstats(client *sshClient, network string, port int, secret string, 
 		"Port":    port,
 		"Secret":  secret,
 		"VHost":   vhost,
+		"Banned":  strings.Join(banned, ","),
 	})
 	files[filepath.Join(workdir, "docker-compose.yaml")] = composefile.Bytes()
 
@@ -97,7 +100,10 @@ func deployEthstats(client *sshClient, network string, port int, secret string, 
 	defer client.Run("rm -rf " + workdir)
 
 	// Build and deploy the ethstats service
-	return nil, client.Stream(fmt.Sprintf("cd %s && docker-compose -p %s up -d --build", workdir, network))
+	if nocache {
+		return nil, client.Stream(fmt.Sprintf("cd %s && docker-compose -p %s build --pull --no-cache && docker-compose -p %s up -d --force-recreate --timeout 60", workdir, network, network))
+	}
+	return nil, client.Stream(fmt.Sprintf("cd %s && docker-compose -p %s up -d --build --force-recreate --timeout 60", workdir, network))
 }
 
 // ethstatsInfos is returned from an ethstats status check to allow reporting
@@ -107,11 +113,18 @@ type ethstatsInfos struct {
 	port   int
 	secret string
 	config string
+	banned []string
 }
 
-// String implements the stringer interface.
-func (info *ethstatsInfos) String() string {
-	return fmt.Sprintf("host=%s, port=%d, secret=%s", info.host, info.port, info.secret)
+// Report converts the typed struct into a plain string->string map, containing
+// most - but not all - fields for reporting to the user.
+func (info *ethstatsInfos) Report() map[string]string {
+	return map[string]string{
+		"Website address":       info.host,
+		"Website listener port": strconv.Itoa(info.port),
+		"Login secret":          info.secret,
+		"Banned addresses":      strings.Join(info.banned, "\n"),
+	}
 }
 
 // checkEthstats does a health-check against an ethstats server to verify whether
@@ -145,6 +158,9 @@ func checkEthstats(client *sshClient, network string) (*ethstatsInfos, error) {
 	if port != 80 && port != 443 {
 		config += fmt.Sprintf(":%d", port)
 	}
+	// Retrieve the IP blacklist
+	banned := strings.Split(infos.envvars["BANNED"], ",")
+
 	// Run a sanity check to see if the port is reachable
 	if err = checkPort(host, port); err != nil {
 		log.Warn("Ethstats service seems unreachable", "server", host, "port", port, "err", err)
@@ -155,5 +171,6 @@ func checkEthstats(client *sshClient, network string) (*ethstatsInfos, error) {
 		port:   port,
 		secret: secret,
 		config: config,
+		banned: banned,
 	}, nil
 }

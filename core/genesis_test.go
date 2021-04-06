@@ -24,20 +24,20 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 )
 
 func TestDefaultGenesisBlock(t *testing.T) {
-	block, _ := DefaultGenesisBlock().ToBlock()
+	block := DefaultGenesisBlock().ToBlock(nil)
 	if block.Hash() != params.MainnetGenesisHash {
 		t.Errorf("wrong mainnet genesis hash, got %v, want %v", block.Hash(), params.MainnetGenesisHash)
 	}
-	block, _ = DefaultTestnetGenesisBlock().ToBlock()
-	if block.Hash() != params.TestnetGenesisHash {
-		t.Errorf("wrong testnet genesis hash, got %v, want %v", block.Hash(), params.TestnetGenesisHash)
+	block = DefaultRopstenGenesisBlock().ToBlock(nil)
+	if block.Hash() != params.RopstenGenesisHash {
+		t.Errorf("wrong ropsten genesis hash, got %v, want %v", block.Hash(), params.RopstenGenesisHash)
 	}
 }
 
@@ -66,7 +66,7 @@ func TestSetupGenesis(t *testing.T) {
 				return SetupGenesisBlock(db, new(Genesis))
 			},
 			wantErr:    errGenesisNoConfig,
-			wantConfig: params.AllProtocolChanges,
+			wantConfig: params.AllEthashProtocolChanges,
 		},
 		{
 			name: "no block in DB, genesis == nil",
@@ -95,14 +95,14 @@ func TestSetupGenesis(t *testing.T) {
 			wantConfig: customg.Config,
 		},
 		{
-			name: "custom block in DB, genesis == testnet",
+			name: "custom block in DB, genesis == ropsten",
 			fn: func(db ethdb.Database) (*params.ChainConfig, common.Hash, error) {
 				customg.MustCommit(db)
-				return SetupGenesisBlock(db, DefaultTestnetGenesisBlock())
+				return SetupGenesisBlock(db, DefaultRopstenGenesisBlock())
 			},
-			wantErr:    &GenesisMismatchError{Stored: customghash, New: params.TestnetGenesisHash},
-			wantHash:   params.TestnetGenesisHash,
-			wantConfig: params.TestnetChainConfig,
+			wantErr:    &GenesisMismatchError{Stored: customghash, New: params.RopstenGenesisHash},
+			wantHash:   params.RopstenGenesisHash,
+			wantConfig: params.RopstenChainConfig,
 		},
 		{
 			name: "compatible config in DB",
@@ -119,9 +119,12 @@ func TestSetupGenesis(t *testing.T) {
 				// Commit the 'old' genesis block with Homestead transition at #2.
 				// Advance to block #4, past the homestead transition block of customg.
 				genesis := oldcustomg.MustCommit(db)
-				bc, _ := NewBlockChain(db, oldcustomg.Config, ethash.NewFullFaker(), new(event.TypeMux), vm.Config{})
-				bc.SetValidator(bproc{})
-				bc.InsertChain(makeBlockChainWithDiff(genesis, []int{2, 3, 4, 5}, 0))
+
+				bc, _ := NewBlockChain(db, nil, oldcustomg.Config, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+				defer bc.Stop()
+
+				blocks, _ := GenerateChain(oldcustomg.Config, genesis, ethash.NewFaker(), db, 4, nil)
+				bc.InsertChain(blocks)
 				bc.CurrentBlock()
 				// This should return a compatibility error.
 				return SetupGenesisBlock(db, &customg)
@@ -138,7 +141,7 @@ func TestSetupGenesis(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		db, _ := ethdb.NewMemDatabase()
+		db := rawdb.NewMemoryDatabase()
 		config, hash, err := test.fn(db)
 		// Check the return values.
 		if !reflect.DeepEqual(err, test.wantErr) {
@@ -152,7 +155,7 @@ func TestSetupGenesis(t *testing.T) {
 			t.Errorf("%s: returned hash %s, want %s", test.name, hash.Hex(), test.wantHash.Hex())
 		} else if err == nil {
 			// Check database content.
-			stored := GetBlock(db, test.wantHash, 0)
+			stored := rawdb.ReadBlock(db, test.wantHash, 0)
 			if stored.Hash() != test.wantHash {
 				t.Errorf("%s: block in DB has hash %s, want %s", test.name, stored.Hash(), test.wantHash)
 			}

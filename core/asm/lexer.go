@@ -48,7 +48,7 @@ const (
 	lineEnd                           // emitted when a line ends
 	invalidStatement                  // any invalid statement
 	element                           // any element during element parsing
-	label                             // label is emitted when a labal is found
+	label                             // label is emitted when a label is found
 	labelDef                          // label definition is emitted when a new label is found
 	number                            // number is emitted when a number is found
 	stringValue                       // stringValue is emitted when a string has been found
@@ -95,7 +95,7 @@ type lexer struct {
 
 // lex lexes the program by name with the given source. It returns a
 // channel on which the tokens are delivered.
-func Lex(name string, source []byte, debug bool) <-chan token {
+func Lex(source []byte, debug bool) <-chan token {
 	ch := make(chan token)
 	l := &lexer{
 		input:  string(source),
@@ -145,7 +145,7 @@ func (l *lexer) ignore() {
 
 // Accepts checks whether the given input matches the next rune
 func (l *lexer) accept(valid string) bool {
-	if strings.IndexRune(valid, l.next()) >= 0 {
+	if strings.ContainsRune(valid, l.next()) {
 		return true
 	}
 
@@ -157,7 +157,7 @@ func (l *lexer) accept(valid string) bool {
 // acceptRun will continue to advance the seeker until valid
 // can no longer be met.
 func (l *lexer) acceptRun(valid string) {
-	for strings.IndexRune(valid, l.next()) >= 0 {
+	for strings.ContainsRune(valid, l.next()) {
 	}
 	l.backup()
 }
@@ -166,7 +166,7 @@ func (l *lexer) acceptRun(valid string) {
 // to advance the seeker until the rune has been found.
 func (l *lexer) acceptRunUntil(until rune) bool {
 	// Continues running until a rune is found
-	for i := l.next(); strings.IndexRune(string(until), i) == -1; i = l.next() {
+	for i := l.next(); !strings.ContainsRune(string(until), i); i = l.next() {
 		if i == 0 {
 			return false
 		}
@@ -206,7 +206,7 @@ func lexLine(l *lexer) stateFn {
 			return lexComment
 		case isSpace(r):
 			l.ignore()
-		case isAlphaNumeric(r) || r == '_':
+		case isLetter(r) || r == '_':
 			return lexElement
 		case isNumber(r):
 			return lexNumber
@@ -234,7 +234,7 @@ func lexComment(l *lexer) stateFn {
 // the lex text state function to advance the parsing
 // process.
 func lexLabel(l *lexer) stateFn {
-	l.acceptRun(Alpha + "_")
+	l.acceptRun(Alpha + "_" + Numbers)
 
 	l.emit(label)
 
@@ -242,7 +242,7 @@ func lexLabel(l *lexer) stateFn {
 }
 
 // lexInsideString lexes the inside of a string until
-// until the state function finds the closing quote.
+// the state function finds the closing quote.
 // It returns the lex text state function.
 func lexInsideString(l *lexer) stateFn {
 	if l.acceptRunUntil('"') {
@@ -254,7 +254,7 @@ func lexInsideString(l *lexer) stateFn {
 
 func lexNumber(l *lexer) stateFn {
 	acceptance := Numbers
-	if l.accept("0") && l.accept("xX") {
+	if l.accept("0") || l.accept("xX") {
 		acceptance = HexadecimalNumbers
 	}
 	l.acceptRun(acceptance)
@@ -278,7 +278,7 @@ func lexElement(l *lexer) stateFn {
 	return lexLine
 }
 
-func isAlphaNumeric(t rune) bool {
+func isLetter(t rune) bool {
 	return unicode.IsLetter(t)
 }
 

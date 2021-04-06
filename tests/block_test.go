@@ -17,10 +17,7 @@
 package tests
 
 import (
-	"math/big"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/params"
 )
 
 func TestBlockchain(t *testing.T) {
@@ -28,54 +25,37 @@ func TestBlockchain(t *testing.T) {
 
 	bt := new(testMatcher)
 	// General state tests are 'exported' as blockchain tests, but we can run them natively.
-	bt.skipLoad(`^GeneralStateTests/`)
-	// Skip random failures due to selfish mining test.
-	bt.skipLoad(`bcForkUncle\.json/ForkUncle`)
-	bt.skipLoad(`^bcMultiChainTest\.json/ChainAtoChainB_blockorder`)
-	bt.skipLoad(`^bcTotalDifficultyTest\.json/(lotsOfLeafs|lotsOfBranches|sideChainWithMoreTransactions)$`)
-	bt.skipLoad(`^bcMultiChainTest\.json/CallContractFromNotBestBlock`)
-	// Expected failures:
-	bt.fails(`(?i)metropolis`, "metropolis is not supported yet")
-	bt.fails(`^TestNetwork/bcTheDaoTest\.json/(DaoTransactions$|DaoTransactions_UncleExtradata$)`, "issue in test")
+	// For speedier CI-runs, the line below can be uncommented, so those are skipped.
+	// For now, in hardfork-times (Berlin), we run the tests both as StateTests and
+	// as blockchain tests, since the latter also covers things like receipt root
+	//bt.skipLoad(`^GeneralStateTests/`)
 
-	bt.config(`^TestNetwork/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(5),
-		DAOForkBlock:   big.NewInt(8),
-		DAOForkSupport: true,
-		EIP150Block:    big.NewInt(10),
-		EIP155Block:    big.NewInt(10),
-		EIP158Block:    big.NewInt(14),
-		// MetropolisBlock: big.NewInt(16),
-	})
-	bt.config(`^RandomTests/.*EIP150`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(0),
-	})
-	bt.config(`^RandomTests/.*EIP158`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(0),
-		EIP155Block:    big.NewInt(0),
-		EIP158Block:    big.NewInt(0),
-	})
-	bt.config(`^RandomTests/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(10),
-	})
-	bt.config(`^Homestead/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-	})
-	bt.config(`^EIP150/`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(0),
-		EIP150Block:    big.NewInt(0),
-	})
-	bt.config(`^[^/]+\.json`, params.ChainConfig{
-		HomesteadBlock: big.NewInt(1000000),
-	})
+	// Skip random failures due to selfish mining test
+	bt.skipLoad(`.*bcForgedTest/bcForkUncle\.json`)
 
+	// Slow tests
+	bt.slow(`.*bcExploitTest/DelegateCallSpam.json`)
+	bt.slow(`.*bcExploitTest/ShanghaiLove.json`)
+	bt.slow(`.*bcExploitTest/SuicideIssue.json`)
+	bt.slow(`.*/bcForkStressTest/`)
+	bt.slow(`.*/bcGasPricerTest/RPC_API_Test.json`)
+	bt.slow(`.*/bcWalletTest/`)
+
+	// Very slow test
+	bt.skipLoad(`.*/stTimeConsuming/.*`)
+
+	// test takes a lot for time and goes easily OOM because of sha3 calculation on a huge range,
+	// using 4.6 TGas
+	bt.skipLoad(`.*randomStatetest94.json.*`)
 	bt.walk(t, blockTestDir, func(t *testing.T, name string, test *BlockTest) {
-		cfg := bt.findConfig(name)
-		if err := bt.checkFailure(t, name, test.Run(cfg)); err != nil {
-			t.Error(err)
+		if err := bt.checkFailure(t, name+"/trie", test.Run(false)); err != nil {
+			t.Errorf("test without snapshotter failed: %v", err)
+		}
+		if err := bt.checkFailure(t, name+"/snap", test.Run(true)); err != nil {
+			t.Errorf("test with snapshotter failed: %v", err)
 		}
 	})
+	// There is also a LegacyTests folder, containing blockchain tests generated
+	// prior to Istanbul. However, they are all derived from GeneralStateTests,
+	// which run natively, so there's no reason to run them here.
 }

@@ -24,7 +24,6 @@ import (
 	"crypto/ecdsa"
 	crand "crypto/rand"
 	"errors"
-	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -43,14 +42,18 @@ import (
 var (
 	ErrLocked  = accounts.NewAuthNeededError("password or unlock")
 	ErrNoMatch = errors.New("no key for given address or file")
-	ErrDecrypt = errors.New("could not decrypt key with given passphrase")
+	ErrDecrypt = errors.New("could not decrypt key with given password")
+
+	// ErrAccountAlreadyExists is returned if an account attempted to import is
+	// already present in the keystore.
+	ErrAccountAlreadyExists = errors.New("account already exists")
 )
 
 // KeyStoreType is the reflect type of a keystore backend.
 var KeyStoreType = reflect.TypeOf(&KeyStore{})
 
 // KeyStoreScheme is the protocol scheme prefixing account and wallet URLs.
-var KeyStoreScheme = "keystore"
+const KeyStoreScheme = "keystore"
 
 // Maximum time between wallet refreshes (if filesystem notifications don't work).
 const walletRefreshCycle = 3 * time.Second
@@ -67,7 +70,8 @@ type KeyStore struct {
 	updateScope event.SubscriptionScope // Subscription scope tracking current live listeners
 	updating    bool                    // Whether the event notification loop is running
 
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	importMu sync.Mutex // Import Mutex locks the import to prevent two insertions from racing
 }
 
 type unlocked struct {
@@ -78,7 +82,7 @@ type unlocked struct {
 // NewKeyStore creates a keystore for the given directory.
 func NewKeyStore(keydir string, scryptN, scryptP int) *KeyStore {
 	keydir, _ = filepath.Abs(keydir)
-	ks := &KeyStore{storage: &keyStorePassphrase{keydir, scryptN, scryptP}}
+	ks := &KeyStore{storage: &keyStorePassphrase{keydir, scryptN, scryptP, false}}
 	ks.init(keydir)
 	return ks
 }
@@ -137,20 +141,22 @@ func (ks *KeyStore) refreshWallets() {
 	accs := ks.cache.accounts()
 
 	// Transform the current list of wallets into the new one
-	wallets := make([]accounts.Wallet, 0, len(accs))
-	events := []accounts.WalletEvent{}
+	var (
+		wallets = make([]accounts.Wallet, 0, len(accs))
+		events  []accounts.WalletEvent
+	)
 
 	for _, account := range accs {
 		// Drop wallets while they were in front of the next account
 		for len(ks.wallets) > 0 && ks.wallets[0].URL().Cmp(account.URL) < 0 {
-			events = append(events, accounts.WalletEvent{Wallet: ks.wallets[0], Arrive: false})
+			events = append(events, accounts.WalletEvent{Wallet: ks.wallets[0], Kind: accounts.WalletDropped})
 			ks.wallets = ks.wallets[1:]
 		}
 		// If there are no more wallets or the account is before the next, wrap new wallet
 		if len(ks.wallets) == 0 || ks.wallets[0].URL().Cmp(account.URL) > 0 {
 			wallet := &keystoreWallet{account: account, keystore: ks}
 
-			events = append(events, accounts.WalletEvent{Wallet: wallet, Arrive: true})
+			events = append(events, accounts.WalletEvent{Wallet: wallet, Kind: accounts.WalletArrived})
 			wallets = append(wallets, wallet)
 			continue
 		}
@@ -163,7 +169,7 @@ func (ks *KeyStore) refreshWallets() {
 	}
 	// Drop any leftover wallets and set the new batch
 	for _, wallet := range ks.wallets {
-		events = append(events, accounts.WalletEvent{Wallet: wallet, Arrive: false})
+		events = append(events, accounts.WalletEvent{Wallet: wallet, Kind: accounts.WalletDropped})
 	}
 	ks.wallets = wallets
 	ks.mu.Unlock()
@@ -277,11 +283,9 @@ func (ks *KeyStore) SignTx(a accounts.Account, tx *types.Transaction, chainID *b
 	if !found {
 		return nil, ErrLocked
 	}
-	// Depending on the presence of the chain ID, sign with EIP155 or homestead
-	if chainID != nil {
-		return types.SignTx(tx, types.NewEIP155Signer(chainID), unlockedKey.PrivateKey)
-	}
-	return types.SignTx(tx, types.HomesteadSigner{}, unlockedKey.PrivateKey)
+	// Depending on the presence of the chain ID, sign with 2718 or homestead
+	signer := types.LatestSignerForChainID(chainID)
+	return types.SignTx(tx, signer, unlockedKey.PrivateKey)
 }
 
 // SignHashWithPassphrase signs hash if the private key matching the given address
@@ -304,12 +308,9 @@ func (ks *KeyStore) SignTxWithPassphrase(a accounts.Account, passphrase string, 
 		return nil, err
 	}
 	defer zeroKey(key.PrivateKey)
-
-	// Depending on the presence of the chain ID, sign with EIP155 or homestead
-	if chainID != nil {
-		return types.SignTx(tx, types.NewEIP155Signer(chainID), key.PrivateKey)
-	}
-	return types.SignTx(tx, types.HomesteadSigner{}, key.PrivateKey)
+	// Depending on the presence of the chain ID, sign with or without replay protection.
+	signer := types.LatestSignerForChainID(chainID)
+	return types.SignTx(tx, signer, key.PrivateKey)
 }
 
 // Unlock unlocks the given account indefinitely.
@@ -441,14 +442,27 @@ func (ks *KeyStore) Import(keyJSON []byte, passphrase, newPassphrase string) (ac
 	if err != nil {
 		return accounts.Account{}, err
 	}
+	ks.importMu.Lock()
+	defer ks.importMu.Unlock()
+
+	if ks.cache.hasAddress(key.Address) {
+		return accounts.Account{
+			Address: key.Address,
+		}, ErrAccountAlreadyExists
+	}
 	return ks.importKey(key, newPassphrase)
 }
 
 // ImportECDSA stores the given key into the key directory, encrypting it with the passphrase.
 func (ks *KeyStore) ImportECDSA(priv *ecdsa.PrivateKey, passphrase string) (accounts.Account, error) {
+	ks.importMu.Lock()
+	defer ks.importMu.Unlock()
+
 	key := newKeyFromECDSA(priv)
 	if ks.cache.hasAddress(key.Address) {
-		return accounts.Account{}, fmt.Errorf("account already exists")
+		return accounts.Account{
+			Address: key.Address,
+		}, ErrAccountAlreadyExists
 	}
 	return ks.importKey(key, passphrase)
 }

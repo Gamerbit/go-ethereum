@@ -28,12 +28,12 @@ import (
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -51,14 +51,13 @@ var (
 
 	testContractCode = common.Hex2Bytes("606060405260cc8060106000396000f360606040526000357c01000000000000000000000000000000000000000000000000000000009004806360cd2685146041578063c16431b914606b57603f565b005b6055600480803590602001909190505060a9565b6040518082815260200191505060405180910390f35b60886004808035906020019091908035906020019091905050608a565b005b80600060005083606481101560025790900160005b50819055505b5050565b6000600060005082606481101560025790900160005b5054905060c7565b91905056")
 	testContractAddr common.Address
-
-	bigTxGas = new(big.Int).SetUint64(params.TxGas)
 )
 
 type testOdr struct {
 	OdrBackend
-	sdb, ldb ethdb.Database
-	disable  bool
+	indexerConfig *IndexerConfig
+	sdb, ldb      ethdb.Database
+	disable       bool
 }
 
 func (odr *testOdr) Database() ethdb.Database {
@@ -73,22 +72,34 @@ func (odr *testOdr) Retrieve(ctx context.Context, req OdrRequest) error {
 	}
 	switch req := req.(type) {
 	case *BlockRequest:
-		req.Rlp = core.GetBodyRLP(odr.sdb, req.Hash, core.GetBlockNumber(odr.sdb, req.Hash))
+		number := rawdb.ReadHeaderNumber(odr.sdb, req.Hash)
+		if number != nil {
+			req.Rlp = rawdb.ReadBodyRLP(odr.sdb, req.Hash, *number)
+		}
 	case *ReceiptsRequest:
-		req.Receipts = core.GetBlockReceipts(odr.sdb, req.Hash, core.GetBlockNumber(odr.sdb, req.Hash))
+		number := rawdb.ReadHeaderNumber(odr.sdb, req.Hash)
+		if number != nil {
+			req.Receipts = rawdb.ReadRawReceipts(odr.sdb, req.Hash, *number)
+		}
 	case *TrieRequest:
-		t, _ := trie.New(req.Id.Root, odr.sdb)
-		req.Proof = t.Prove(req.Key)
+		t, _ := trie.New(req.Id.Root, trie.NewDatabase(odr.sdb))
+		nodes := NewNodeSet()
+		t.Prove(req.Key, 0, nodes)
+		req.Proof = nodes
 	case *CodeRequest:
-		req.Data, _ = odr.sdb.Get(req.Hash[:])
+		req.Data = rawdb.ReadCode(odr.sdb, req.Hash)
 	}
 	req.StoreResult(odr.ldb)
 	return nil
 }
 
+func (odr *testOdr) IndexerConfig() *IndexerConfig {
+	return odr.indexerConfig
+}
+
 type odrTestFn func(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc *LightChain, bhash common.Hash) ([]byte, error)
 
-func TestOdrGetBlockLes1(t *testing.T) { testChainOdr(t, 1, odrGetBlock) }
+func TestOdrGetBlockLes2(t *testing.T) { testChainOdr(t, 1, odrGetBlock) }
 
 func odrGetBlock(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc *LightChain, bhash common.Hash) ([]byte, error) {
 	var block *types.Block
@@ -104,14 +115,20 @@ func odrGetBlock(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc
 	return rlp, nil
 }
 
-func TestOdrGetReceiptsLes1(t *testing.T) { testChainOdr(t, 1, odrGetReceipts) }
+func TestOdrGetReceiptsLes2(t *testing.T) { testChainOdr(t, 1, odrGetReceipts) }
 
 func odrGetReceipts(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc *LightChain, bhash common.Hash) ([]byte, error) {
 	var receipts types.Receipts
 	if bc != nil {
-		receipts = core.GetBlockReceipts(db, bhash, core.GetBlockNumber(db, bhash))
+		number := rawdb.ReadHeaderNumber(db, bhash)
+		if number != nil {
+			receipts = rawdb.ReadReceipts(db, bhash, *number, bc.Config())
+		}
 	} else {
-		receipts, _ = GetBlockReceipts(ctx, lc.Odr(), bhash, core.GetBlockNumber(db, bhash))
+		number := rawdb.ReadHeaderNumber(db, bhash)
+		if number != nil {
+			receipts, _ = GetBlockReceipts(ctx, lc.Odr(), bhash, *number)
+		}
 	}
 	if receipts == nil {
 		return nil, nil
@@ -120,7 +137,7 @@ func odrGetReceipts(ctx context.Context, db ethdb.Database, bc *core.BlockChain,
 	return rlp, nil
 }
 
-func TestOdrAccountsLes1(t *testing.T) { testChainOdr(t, 1, odrAccounts) }
+func TestOdrAccountsLes2(t *testing.T) { testChainOdr(t, 1, odrAccounts) }
 
 func odrAccounts(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc *LightChain, bhash common.Hash) ([]byte, error) {
 	dummyAddr := common.HexToAddress("1234567812345678123456781234567812345678")
@@ -132,7 +149,7 @@ func odrAccounts(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc
 		st = NewState(ctx, header, lc.Odr())
 	} else {
 		header := bc.GetHeaderByHash(bhash)
-		st, _ = state.New(header.Root, state.NewDatabase(db))
+		st, _ = state.New(header.Root, state.NewDatabase(db), nil)
 	}
 
 	var res []byte
@@ -144,7 +161,7 @@ func odrAccounts(ctx context.Context, db ethdb.Database, bc *core.BlockChain, lc
 	return res, st.Error()
 }
 
-func TestOdrContractCallLes1(t *testing.T) { testChainOdr(t, 1, odrContractCall) }
+func TestOdrContractCallLes2(t *testing.T) { testChainOdr(t, 1, odrContractCall) }
 
 type callmsg struct {
 	types.Message
@@ -172,17 +189,18 @@ func odrContractCall(ctx context.Context, db ethdb.Database, bc *core.BlockChain
 		} else {
 			chain = bc
 			header = bc.GetHeaderByHash(bhash)
-			st, _ = state.New(header.Root, state.NewDatabase(db))
+			st, _ = state.New(header.Root, state.NewDatabase(db), nil)
 		}
 
 		// Perform read-only call.
 		st.SetBalance(testBankAddress, math.MaxBig256)
-		msg := callmsg{types.NewMessage(testBankAddress, &testContractAddr, 0, new(big.Int), big.NewInt(1000000), new(big.Int), data, false)}
-		context := core.NewEVMContext(msg, header, chain, nil)
-		vmenv := vm.NewEVM(context, st, config, vm.Config{})
-		gp := new(core.GasPool).AddGas(math.MaxBig256)
-		ret, _, _ := core.ApplyMessage(vmenv, msg, gp)
-		res = append(res, ret...)
+		msg := callmsg{types.NewMessage(testBankAddress, &testContractAddr, 0, new(big.Int), 1000000, new(big.Int), data, nil, false)}
+		txContext := core.NewEVMTxContext(msg)
+		context := core.NewEVMBlockContext(header, chain, nil)
+		vmenv := vm.NewEVM(context, txContext, st, config, vm.Config{})
+		gp := new(core.GasPool).AddGas(math.MaxUint64)
+		result, _ := core.ApplyMessage(vmenv, msg, gp)
+		res = append(res, result.Return()...)
 		if st.Error() != nil {
 			return res, st.Error()
 		}
@@ -195,17 +213,17 @@ func testChainGen(i int, block *core.BlockGen) {
 	switch i {
 	case 0:
 		// In block 1, the test bank sends account #1 some ether.
-		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), acc1Addr, big.NewInt(10000), bigTxGas, nil, nil), signer, testBankKey)
+		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), acc1Addr, big.NewInt(10000), params.TxGas, nil, nil), signer, testBankKey)
 		block.AddTx(tx)
 	case 1:
 		// In block 2, the test bank sends some more ether to account #1.
 		// acc1Addr passes it on to account #2.
 		// acc1Addr creates a test contract.
-		tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), acc1Addr, big.NewInt(1000), bigTxGas, nil, nil), signer, testBankKey)
+		tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), acc1Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, testBankKey)
 		nonce := block.TxNonce(acc1Addr)
-		tx2, _ := types.SignTx(types.NewTransaction(nonce, acc2Addr, big.NewInt(1000), bigTxGas, nil, nil), signer, acc1Key)
+		tx2, _ := types.SignTx(types.NewTransaction(nonce, acc2Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, acc1Key)
 		nonce++
-		tx3, _ := types.SignTx(types.NewContractCreation(nonce, big.NewInt(0), big.NewInt(1000000), big.NewInt(0), testContractCode), signer, acc1Key)
+		tx3, _ := types.SignTx(types.NewContractCreation(nonce, big.NewInt(0), 1000000, big.NewInt(0), testContractCode), signer, acc1Key)
 		testContractAddr = crypto.CreateAddress(acc1Addr, nonce)
 		block.AddTx(tx1)
 		block.AddTx(tx2)
@@ -215,7 +233,7 @@ func testChainGen(i int, block *core.BlockGen) {
 		block.SetCoinbase(acc2Addr)
 		block.SetExtra([]byte("yeehaw"))
 		data := common.Hex2Bytes("C16431B900000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001")
-		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), testContractAddr, big.NewInt(0), big.NewInt(100000), nil, data), signer, testBankKey)
+		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), testContractAddr, big.NewInt(0), 100000, nil, data), signer, testBankKey)
 		block.AddTx(tx)
 	case 3:
 		// Block 4 includes blocks 2 and 3 as uncle headers (with modified extra data).
@@ -226,29 +244,28 @@ func testChainGen(i int, block *core.BlockGen) {
 		b3.Extra = []byte("foo")
 		block.AddUncle(b3)
 		data := common.Hex2Bytes("C16431B900000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000002")
-		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), testContractAddr, big.NewInt(0), big.NewInt(100000), nil, data), signer, testBankKey)
+		tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBankAddress), testContractAddr, big.NewInt(0), 100000, nil, data), signer, testBankKey)
 		block.AddTx(tx)
 	}
 }
 
 func testChainOdr(t *testing.T, protocol int, fn odrTestFn) {
 	var (
-		evmux   = new(event.TypeMux)
-		sdb, _  = ethdb.NewMemDatabase()
-		ldb, _  = ethdb.NewMemDatabase()
+		sdb     = rawdb.NewMemoryDatabase()
+		ldb     = rawdb.NewMemoryDatabase()
 		gspec   = core.Genesis{Alloc: core.GenesisAlloc{testBankAddress: {Balance: testBankFunds}}}
 		genesis = gspec.MustCommit(sdb)
 	)
 	gspec.MustCommit(ldb)
 	// Assemble the test environment
-	blockchain, _ := core.NewBlockChain(sdb, params.TestChainConfig, ethash.NewFullFaker(), evmux, vm.Config{})
-	gchain, _ := core.GenerateChain(params.TestChainConfig, genesis, sdb, 4, testChainGen)
+	blockchain, _ := core.NewBlockChain(sdb, nil, params.TestChainConfig, ethash.NewFullFaker(), vm.Config{}, nil, nil)
+	gchain, _ := core.GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), sdb, 4, testChainGen)
 	if _, err := blockchain.InsertChain(gchain); err != nil {
 		t.Fatal(err)
 	}
 
-	odr := &testOdr{sdb: sdb, ldb: ldb}
-	lightchain, err := NewLightChain(odr, params.TestChainConfig, ethash.NewFullFaker(), evmux)
+	odr := &testOdr{sdb: sdb, ldb: ldb, indexerConfig: TestClientIndexerConfig}
+	lightchain, err := NewLightChain(odr, params.TestChainConfig, ethash.NewFullFaker(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +279,7 @@ func testChainOdr(t *testing.T, protocol int, fn odrTestFn) {
 
 	test := func(expFail int) {
 		for i := uint64(0); i <= blockchain.CurrentHeader().Number.Uint64(); i++ {
-			bhash := core.GetCanonicalHash(sdb, i)
+			bhash := rawdb.ReadCanonicalHash(sdb, i)
 			b1, err := fn(NoOdr, sdb, blockchain, nil, bhash)
 			if err != nil {
 				t.Fatalf("error in full-node test for block %d: %v", i, err)

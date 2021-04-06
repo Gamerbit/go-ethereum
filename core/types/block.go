@@ -22,19 +22,18 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"sort"
+	"reflect"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/crypto/sha3"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
 var (
-	EmptyRootHash  = DeriveSha(Transactions{})
-	EmptyUncleHash = CalcUncleHash(nil)
+	EmptyRootHash  = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+	EmptyUncleHash = rlpHash([]*Header(nil))
 )
 
 // A BlockNonce is a 64-bit hash which proves (combined with the
@@ -77,21 +76,21 @@ type Header struct {
 	Bloom       Bloom          `json:"logsBloom"        gencodec:"required"`
 	Difficulty  *big.Int       `json:"difficulty"       gencodec:"required"`
 	Number      *big.Int       `json:"number"           gencodec:"required"`
-	GasLimit    *big.Int       `json:"gasLimit"         gencodec:"required"`
-	GasUsed     *big.Int       `json:"gasUsed"          gencodec:"required"`
-	Time        *big.Int       `json:"timestamp"        gencodec:"required"`
+	GasLimit    uint64         `json:"gasLimit"         gencodec:"required"`
+	GasUsed     uint64         `json:"gasUsed"          gencodec:"required"`
+	Time        uint64         `json:"timestamp"        gencodec:"required"`
 	Extra       []byte         `json:"extraData"        gencodec:"required"`
-	MixDigest   common.Hash    `json:"mixHash"          gencodec:"required"`
-	Nonce       BlockNonce     `json:"nonce"            gencodec:"required"`
+	MixDigest   common.Hash    `json:"mixHash"`
+	Nonce       BlockNonce     `json:"nonce"`
 }
 
 // field type overrides for gencodec
 type headerMarshaling struct {
 	Difficulty *hexutil.Big
 	Number     *hexutil.Big
-	GasLimit   *hexutil.Big
-	GasUsed    *hexutil.Big
-	Time       *hexutil.Big
+	GasLimit   hexutil.Uint64
+	GasUsed    hexutil.Uint64
+	Time       hexutil.Uint64
 	Extra      hexutil.Bytes
 	Hash       common.Hash `json:"hash"` // adds call to Hash() in MarshalJSON
 }
@@ -102,30 +101,42 @@ func (h *Header) Hash() common.Hash {
 	return rlpHash(h)
 }
 
-// HashNoNonce returns the hash which is used as input for the proof-of-work search.
-func (h *Header) HashNoNonce() common.Hash {
-	return rlpHash([]interface{}{
-		h.ParentHash,
-		h.UncleHash,
-		h.Coinbase,
-		h.Root,
-		h.TxHash,
-		h.ReceiptHash,
-		h.Bloom,
-		h.Difficulty,
-		h.Number,
-		h.GasLimit,
-		h.GasUsed,
-		h.Time,
-		h.Extra,
-	})
+var headerSize = common.StorageSize(reflect.TypeOf(Header{}).Size())
+
+// Size returns the approximate memory used by all internal contents. It is used
+// to approximate and limit the memory consumption of various caches.
+func (h *Header) Size() common.StorageSize {
+	return headerSize + common.StorageSize(len(h.Extra)+(h.Difficulty.BitLen()+h.Number.BitLen())/8)
 }
 
-func rlpHash(x interface{}) (h common.Hash) {
-	hw := sha3.NewKeccak256()
-	rlp.Encode(hw, x)
-	hw.Sum(h[:0])
-	return h
+// SanityCheck checks a few basic things -- these checks are way beyond what
+// any 'sane' production values should hold, and can mainly be used to prevent
+// that the unbounded fields are stuffed with junk data to add processing
+// overhead
+func (h *Header) SanityCheck() error {
+	if h.Number != nil && !h.Number.IsUint64() {
+		return fmt.Errorf("too large block number: bitlen %d", h.Number.BitLen())
+	}
+	if h.Difficulty != nil {
+		if diffLen := h.Difficulty.BitLen(); diffLen > 80 {
+			return fmt.Errorf("too large block difficulty: bitlen %d", diffLen)
+		}
+	}
+	if eLen := len(h.Extra); eLen > 100*1024 {
+		return fmt.Errorf("too large block extradata: size %d", eLen)
+	}
+	return nil
+}
+
+// EmptyBody returns true if there is no additional 'body' to complete the header
+// that is: no transactions and no uncles.
+func (h *Header) EmptyBody() bool {
+	return h.TxHash == EmptyRootHash && h.UncleHash == EmptyUncleHash
+}
+
+// EmptyReceipts returns true if there are no receipts for this header/block.
+func (h *Header) EmptyReceipts() bool {
+	return h.ReceiptHash == EmptyRootHash
 }
 
 // Body is a simple (mutable, non-safe) data container for storing and moving
@@ -191,14 +202,14 @@ type storageblock struct {
 // The values of TxHash, UncleHash, ReceiptHash and Bloom in header
 // are ignored and set to values derived from the given txs, uncles
 // and receipts.
-func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*Receipt) *Block {
+func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*Receipt, hasher TrieHasher) *Block {
 	b := &Block{header: CopyHeader(header), td: new(big.Int)}
 
 	// TODO: panic if len(txs) != len(receipts)
 	if len(txs) == 0 {
 		b.header.TxHash = EmptyRootHash
 	} else {
-		b.header.TxHash = DeriveSha(Transactions(txs))
+		b.header.TxHash = DeriveSha(Transactions(txs), hasher)
 		b.transactions = make(Transactions, len(txs))
 		copy(b.transactions, txs)
 	}
@@ -206,7 +217,7 @@ func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*
 	if len(receipts) == 0 {
 		b.header.ReceiptHash = EmptyRootHash
 	} else {
-		b.header.ReceiptHash = DeriveSha(Receipts(receipts))
+		b.header.ReceiptHash = DeriveSha(Receipts(receipts), hasher)
 		b.header.Bloom = CreateBloom(receipts)
 	}
 
@@ -234,20 +245,11 @@ func NewBlockWithHeader(header *Header) *Block {
 // modifying a header variable.
 func CopyHeader(h *Header) *Header {
 	cpy := *h
-	if cpy.Time = new(big.Int); h.Time != nil {
-		cpy.Time.Set(h.Time)
-	}
 	if cpy.Difficulty = new(big.Int); h.Difficulty != nil {
 		cpy.Difficulty.Set(h.Difficulty)
 	}
 	if cpy.Number = new(big.Int); h.Number != nil {
 		cpy.Number.Set(h.Number)
-	}
-	if cpy.GasLimit = new(big.Int); h.GasLimit != nil {
-		cpy.GasLimit.Set(h.GasLimit)
-	}
-	if cpy.GasUsed = new(big.Int); h.GasUsed != nil {
-		cpy.GasUsed.Set(h.GasUsed)
 	}
 	if len(h.Extra) > 0 {
 		cpy.Extra = make([]byte, len(h.Extra))
@@ -302,10 +304,10 @@ func (b *Block) Transaction(hash common.Hash) *Transaction {
 }
 
 func (b *Block) Number() *big.Int     { return new(big.Int).Set(b.header.Number) }
-func (b *Block) GasLimit() *big.Int   { return new(big.Int).Set(b.header.GasLimit) }
-func (b *Block) GasUsed() *big.Int    { return new(big.Int).Set(b.header.GasUsed) }
+func (b *Block) GasLimit() uint64     { return b.header.GasLimit }
+func (b *Block) GasUsed() uint64      { return b.header.GasUsed }
 func (b *Block) Difficulty() *big.Int { return new(big.Int).Set(b.header.Difficulty) }
-func (b *Block) Time() *big.Int       { return new(big.Int).Set(b.header.Time) }
+func (b *Block) Time() uint64         { return b.header.Time }
 
 func (b *Block) NumberU64() uint64        { return b.header.Number.Uint64() }
 func (b *Block) MixDigest() common.Hash   { return b.header.MixDigest }
@@ -324,10 +326,8 @@ func (b *Block) Header() *Header { return CopyHeader(b.header) }
 // Body returns the non-header content of the block.
 func (b *Block) Body() *Body { return &Body{b.transactions, b.uncles} }
 
-func (b *Block) HashNoNonce() common.Hash {
-	return b.header.HashNoNonce()
-}
-
+// Size returns the true RLP encoded storage size of the block, either by encoding
+// and returning it, or returning a previsouly cached value.
 func (b *Block) Size() common.StorageSize {
 	if size := b.size.Load(); size != nil {
 		return size.(common.StorageSize)
@@ -338,6 +338,12 @@ func (b *Block) Size() common.StorageSize {
 	return common.StorageSize(c)
 }
 
+// SanityCheck can be used to prevent that unbounded fields are
+// stuffed with junk data to add processing overhead
+func (b *Block) SanityCheck() error {
+	return b.header.SanityCheck()
+}
+
 type writeCounter common.StorageSize
 
 func (c *writeCounter) Write(b []byte) (int, error) {
@@ -346,6 +352,9 @@ func (c *writeCounter) Write(b []byte) (int, error) {
 }
 
 func CalcUncleHash(uncles []*Header) common.Hash {
+	if len(uncles) == 0 {
+		return EmptyUncleHash
+	}
 	return rlpHash(uncles)
 }
 
@@ -386,61 +395,4 @@ func (b *Block) Hash() common.Hash {
 	return v
 }
 
-func (b *Block) String() string {
-	str := fmt.Sprintf(`Block(#%v): Size: %v {
-MinerHash: %x
-%v
-Transactions:
-%v
-Uncles:
-%v
-}
-`, b.Number(), b.Size(), b.header.HashNoNonce(), b.header, b.transactions, b.uncles)
-	return str
-}
-
-func (h *Header) String() string {
-	return fmt.Sprintf(`Header(%x):
-[
-	ParentHash:	    %x
-	UncleHash:	    %x
-	Coinbase:	    %x
-	Root:		    %x
-	TxSha		    %x
-	ReceiptSha:	    %x
-	Bloom:		    %x
-	Difficulty:	    %v
-	Number:		    %v
-	GasLimit:	    %v
-	GasUsed:	    %v
-	Time:		    %v
-	Extra:		    %s
-	MixDigest:      %x
-	Nonce:		    %x
-]`, h.Hash(), h.ParentHash, h.UncleHash, h.Coinbase, h.Root, h.TxHash, h.ReceiptHash, h.Bloom, h.Difficulty, h.Number, h.GasLimit, h.GasUsed, h.Time, h.Extra, h.MixDigest, h.Nonce)
-}
-
 type Blocks []*Block
-
-type BlockBy func(b1, b2 *Block) bool
-
-func (self BlockBy) Sort(blocks Blocks) {
-	bs := blockSorter{
-		blocks: blocks,
-		by:     self,
-	}
-	sort.Sort(bs)
-}
-
-type blockSorter struct {
-	blocks Blocks
-	by     func(b1, b2 *Block) bool
-}
-
-func (self blockSorter) Len() int { return len(self.blocks) }
-func (self blockSorter) Swap(i, j int) {
-	self.blocks[i], self.blocks[j] = self.blocks[j], self.blocks[i]
-}
-func (self blockSorter) Less(i, j int) bool { return self.by(self.blocks[i], self.blocks[j]) }
-
-func Number(b1, b2 *Block) bool { return b1.header.Number.Cmp(b2.header.Number) < 0 }

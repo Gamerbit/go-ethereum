@@ -26,7 +26,7 @@ func (g Genesis) MarshalJSON() ([]byte, error) {
 		Mixhash    common.Hash                                 `json:"mixHash"`
 		Coinbase   common.Address                              `json:"coinbase"`
 		Alloc      map[common.UnprefixedAddress]GenesisAccount `json:"alloc"      gencodec:"required"`
-		Number     uint64                                      `json:"number"`
+		Number     math.HexOrDecimal64                         `json:"number"`
 		GasUsed    math.HexOrDecimal64                         `json:"gasUsed"`
 		ParentHash common.Hash                                 `json:"parentHash"`
 	}
@@ -45,7 +45,7 @@ func (g Genesis) MarshalJSON() ([]byte, error) {
 			enc.Alloc[common.UnprefixedAddress(k)] = v
 		}
 	}
-	enc.Number = g.Number
+	enc.Number = math.HexOrDecimal64(g.Number)
 	enc.GasUsed = math.HexOrDecimal64(g.GasUsed)
 	enc.ParentHash = g.ParentHash
 	return json.Marshal(&enc)
@@ -56,13 +56,13 @@ func (g *Genesis) UnmarshalJSON(input []byte) error {
 		Config     *params.ChainConfig                         `json:"config"`
 		Nonce      *math.HexOrDecimal64                        `json:"nonce"`
 		Timestamp  *math.HexOrDecimal64                        `json:"timestamp"`
-		ExtraData  hexutil.Bytes                               `json:"extraData"`
+		ExtraData  *hexutil.Bytes                              `json:"extraData"`
 		GasLimit   *math.HexOrDecimal64                        `json:"gasLimit"   gencodec:"required"`
 		Difficulty *math.HexOrDecimal256                       `json:"difficulty" gencodec:"required"`
 		Mixhash    *common.Hash                                `json:"mixHash"`
 		Coinbase   *common.Address                             `json:"coinbase"`
 		Alloc      map[common.UnprefixedAddress]GenesisAccount `json:"alloc"      gencodec:"required"`
-		Number     *uint64                                     `json:"number"`
+		Number     *math.HexOrDecimal64                        `json:"number"`
 		GasUsed    *math.HexOrDecimal64                        `json:"gasUsed"`
 		ParentHash *common.Hash                                `json:"parentHash"`
 	}
@@ -80,7 +80,7 @@ func (g *Genesis) UnmarshalJSON(input []byte) error {
 		g.Timestamp = uint64(*dec.Timestamp)
 	}
 	if dec.ExtraData != nil {
-		g.ExtraData = dec.ExtraData
+		g.ExtraData = *dec.ExtraData
 	}
 	if dec.GasLimit == nil {
 		return errors.New("missing required field 'gasLimit' for Genesis")
@@ -104,7 +104,7 @@ func (g *Genesis) UnmarshalJSON(input []byte) error {
 		g.Alloc[common.Address(k)] = v
 	}
 	if dec.Number != nil {
-		g.Number = *dec.Number
+		g.Number = uint64(*dec.Number)
 	}
 	if dec.GasUsed != nil {
 		g.GasUsed = uint64(*dec.GasUsed)

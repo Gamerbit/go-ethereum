@@ -26,10 +26,10 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -44,14 +44,14 @@ func (t *VMTest) UnmarshalJSON(data []byte) error {
 }
 
 type vmJSON struct {
-	Env           stEnv                `json:"env"`
-	Exec          vmExec               `json:"exec"`
-	Logs          []stLog              `json:"logs"`
-	GasRemaining  *math.HexOrDecimal64 `json:"gas"`
-	Out           hexutil.Bytes        `json:"out"`
-	Pre           core.GenesisAlloc    `json:"pre"`
-	Post          core.GenesisAlloc    `json:"post"`
-	PostStateRoot common.Hash          `json:"postStateRoot"`
+	Env           stEnv                 `json:"env"`
+	Exec          vmExec                `json:"exec"`
+	Logs          common.UnprefixedHash `json:"logs"`
+	GasRemaining  *math.HexOrDecimal64  `json:"gas"`
+	Out           hexutil.Bytes         `json:"out"`
+	Pre           core.GenesisAlloc     `json:"pre"`
+	Post          core.GenesisAlloc     `json:"post"`
+	PostStateRoot common.Hash           `json:"postStateRoot"`
 }
 
 //go:generate gencodec -type vmExec -field-override vmExecMarshaling -out gen_vmexec.go
@@ -78,9 +78,16 @@ type vmExecMarshaling struct {
 	GasPrice *math.HexOrDecimal256
 }
 
-func (t *VMTest) Run(vmconfig vm.Config) error {
-	db, _ := ethdb.NewMemDatabase()
-	statedb := makePreState(db, t.json.Pre)
+func (t *VMTest) Run(vmconfig vm.Config, snapshotter bool) error {
+	snaps, statedb := MakePreState(rawdb.NewMemoryDatabase(), t.json.Pre, snapshotter)
+	if snapshotter {
+		preRoot := statedb.IntermediateRoot(false)
+		defer func() {
+			if _, err := snaps.Journal(preRoot); err != nil {
+				panic(err)
+			}
+		}()
+	}
 	ret, gasRemaining, err := t.exec(statedb, vmconfig)
 
 	if t.json.GasRemaining == nil {
@@ -109,7 +116,10 @@ func (t *VMTest) Run(vmconfig vm.Config) error {
 	// if root := statedb.IntermediateRoot(false); root != t.json.PostStateRoot {
 	// 	return fmt.Errorf("post state root mismatch, got %x, want %x", root, t.json.PostStateRoot)
 	// }
-	return checkLogs(statedb.Logs(), t.json.Logs)
+	if logs := rlpHash(statedb.Logs()); logs != common.Hash(t.json.Logs) {
+		return fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, t.json.Logs)
+	}
+	return nil
 }
 
 func (t *VMTest) exec(statedb *state.StateDB, vmconfig vm.Config) ([]byte, uint64, error) {
@@ -128,20 +138,22 @@ func (t *VMTest) newEVM(statedb *state.StateDB, vmconfig vm.Config) *vm.EVM {
 		return core.CanTransfer(db, address, amount)
 	}
 	transfer := func(db vm.StateDB, sender, recipient common.Address, amount *big.Int) {}
-	context := vm.Context{
+	txContext := vm.TxContext{
+		Origin:   t.json.Exec.Origin,
+		GasPrice: t.json.Exec.GasPrice,
+	}
+	context := vm.BlockContext{
 		CanTransfer: canTransfer,
 		Transfer:    transfer,
 		GetHash:     vmTestBlockHash,
-		Origin:      t.json.Exec.Origin,
 		Coinbase:    t.json.Env.Coinbase,
 		BlockNumber: new(big.Int).SetUint64(t.json.Env.Number),
 		Time:        new(big.Int).SetUint64(t.json.Env.Timestamp),
 		GasLimit:    t.json.Env.GasLimit,
 		Difficulty:  t.json.Env.Difficulty,
-		GasPrice:    t.json.Exec.GasPrice,
 	}
 	vmconfig.NoRecursion = true
-	return vm.NewEVM(context, statedb, params.MainnetChainConfig, vmconfig)
+	return vm.NewEVM(context, txContext, statedb, params.MainnetChainConfig, vmconfig)
 }
 
 func vmTestBlockHash(n uint64) common.Hash {

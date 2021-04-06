@@ -25,16 +25,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/rpc"
-)
-
-var (
-	deadline = 5 * time.Minute // consider a filter inactive if it has not been polled for within deadline
 )
 
 // filter is a helper struct that holds meta information over the filter type
@@ -52,66 +49,74 @@ type filter struct {
 // information related to the Ethereum protocol such als blocks, transactions and logs.
 type PublicFilterAPI struct {
 	backend   Backend
-	useMipMap bool
 	mux       *event.TypeMux
 	quit      chan struct{}
 	chainDb   ethdb.Database
 	events    *EventSystem
 	filtersMu sync.Mutex
 	filters   map[rpc.ID]*filter
+	timeout   time.Duration
 }
 
 // NewPublicFilterAPI returns a new PublicFilterAPI instance.
-func NewPublicFilterAPI(backend Backend, lightMode bool) *PublicFilterAPI {
+func NewPublicFilterAPI(backend Backend, lightMode bool, timeout time.Duration) *PublicFilterAPI {
 	api := &PublicFilterAPI{
-		backend:   backend,
-		useMipMap: !lightMode,
-		mux:       backend.EventMux(),
-		chainDb:   backend.ChainDb(),
-		events:    NewEventSystem(backend.EventMux(), backend, lightMode),
-		filters:   make(map[rpc.ID]*filter),
+		backend: backend,
+		chainDb: backend.ChainDb(),
+		events:  NewEventSystem(backend, lightMode),
+		filters: make(map[rpc.ID]*filter),
+		timeout: timeout,
 	}
-
-	go api.timeoutLoop()
+	go api.timeoutLoop(timeout)
 
 	return api
 }
 
 // timeoutLoop runs every 5 minutes and deletes filters that have not been recently used.
 // Tt is started when the api is created.
-func (api *PublicFilterAPI) timeoutLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+func (api *PublicFilterAPI) timeoutLoop(timeout time.Duration) {
+	var toUninstall []*Subscription
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
 	for {
 		<-ticker.C
 		api.filtersMu.Lock()
 		for id, f := range api.filters {
 			select {
 			case <-f.deadline.C:
-				f.s.Unsubscribe()
+				toUninstall = append(toUninstall, f.s)
 				delete(api.filters, id)
 			default:
 				continue
 			}
 		}
 		api.filtersMu.Unlock()
+
+		// Unsubscribes are processed outside the lock to avoid the following scenario:
+		// event loop attempts broadcasting events to still active filters while
+		// Unsubscribe is waiting for it to process the uninstall request.
+		for _, s := range toUninstall {
+			s.Unsubscribe()
+		}
+		toUninstall = nil
 	}
 }
 
 // NewPendingTransactionFilter creates a filter that fetches pending transaction hashes
 // as transactions enter the pending state.
 //
-// It is part of the filter package because this filter can be used throug the
+// It is part of the filter package because this filter can be used through the
 // `eth_getFilterChanges` polling method that is also used for log filters.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_newpendingtransactionfilter
+// https://eth.wiki/json-rpc/API#eth_newpendingtransactionfilter
 func (api *PublicFilterAPI) NewPendingTransactionFilter() rpc.ID {
 	var (
-		pendingTxs   = make(chan common.Hash)
-		pendingTxSub = api.events.SubscribePendingTxEvents(pendingTxs)
+		pendingTxs   = make(chan []common.Hash)
+		pendingTxSub = api.events.SubscribePendingTxs(pendingTxs)
 	)
 
 	api.filtersMu.Lock()
-	api.filters[pendingTxSub.ID] = &filter{typ: PendingTransactionsSubscription, deadline: time.NewTimer(deadline), hashes: make([]common.Hash, 0), s: pendingTxSub}
+	api.filters[pendingTxSub.ID] = &filter{typ: PendingTransactionsSubscription, deadline: time.NewTimer(api.timeout), hashes: make([]common.Hash, 0), s: pendingTxSub}
 	api.filtersMu.Unlock()
 
 	go func() {
@@ -120,7 +125,7 @@ func (api *PublicFilterAPI) NewPendingTransactionFilter() rpc.ID {
 			case ph := <-pendingTxs:
 				api.filtersMu.Lock()
 				if f, found := api.filters[pendingTxSub.ID]; found {
-					f.hashes = append(f.hashes, ph)
+					f.hashes = append(f.hashes, ph...)
 				}
 				api.filtersMu.Unlock()
 			case <-pendingTxSub.Err():
@@ -146,13 +151,17 @@ func (api *PublicFilterAPI) NewPendingTransactions(ctx context.Context) (*rpc.Su
 	rpcSub := notifier.CreateSubscription()
 
 	go func() {
-		txHashes := make(chan common.Hash)
-		pendingTxSub := api.events.SubscribePendingTxEvents(txHashes)
+		txHashes := make(chan []common.Hash, 128)
+		pendingTxSub := api.events.SubscribePendingTxs(txHashes)
 
 		for {
 			select {
-			case h := <-txHashes:
-				notifier.Notify(rpcSub.ID, h)
+			case hashes := <-txHashes:
+				// To keep the original behaviour, send a single tx hash in one notification.
+				// TODO(rjl493456442) Send a batch of tx hashes in one notification
+				for _, h := range hashes {
+					notifier.Notify(rpcSub.ID, h)
+				}
 			case <-rpcSub.Err():
 				pendingTxSub.Unsubscribe()
 				return
@@ -169,7 +178,7 @@ func (api *PublicFilterAPI) NewPendingTransactions(ctx context.Context) (*rpc.Su
 // NewBlockFilter creates a filter that fetches blocks that are imported into the chain.
 // It is part of the filter package since polling goes with eth_getFilterChanges.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_newblockfilter
+// https://eth.wiki/json-rpc/API#eth_newblockfilter
 func (api *PublicFilterAPI) NewBlockFilter() rpc.ID {
 	var (
 		headers   = make(chan *types.Header)
@@ -177,7 +186,7 @@ func (api *PublicFilterAPI) NewBlockFilter() rpc.ID {
 	)
 
 	api.filtersMu.Lock()
-	api.filters[headerSub.ID] = &filter{typ: BlocksSubscription, deadline: time.NewTimer(deadline), hashes: make([]common.Hash, 0), s: headerSub}
+	api.filters[headerSub.ID] = &filter{typ: BlocksSubscription, deadline: time.NewTimer(api.timeout), hashes: make([]common.Hash, 0), s: headerSub}
 	api.filtersMu.Unlock()
 
 	go func() {
@@ -243,7 +252,7 @@ func (api *PublicFilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc
 		matchedLogs = make(chan []*types.Log)
 	)
 
-	logsSub, err := api.events.SubscribeLogs(crit, matchedLogs)
+	logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), matchedLogs)
 	if err != nil {
 		return nil, err
 	}
@@ -270,12 +279,8 @@ func (api *PublicFilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc
 }
 
 // FilterCriteria represents a request to create a new filter.
-type FilterCriteria struct {
-	FromBlock *big.Int
-	ToBlock   *big.Int
-	Addresses []common.Address
-	Topics    [][]common.Hash
-}
+// Same as ethereum.FilterQuery but with UnmarshalJSON() method.
+type FilterCriteria ethereum.FilterQuery
 
 // NewFilter creates a new filter and returns the filter id. It can be
 // used to retrieve logs when the state changes. This method cannot be
@@ -289,16 +294,16 @@ type FilterCriteria struct {
 //
 // In case "fromBlock" > "toBlock" an error is returned.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_newfilter
+// https://eth.wiki/json-rpc/API#eth_newfilter
 func (api *PublicFilterAPI) NewFilter(crit FilterCriteria) (rpc.ID, error) {
 	logs := make(chan []*types.Log)
-	logsSub, err := api.events.SubscribeLogs(crit, logs)
+	logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), logs)
 	if err != nil {
-		return rpc.ID(""), err
+		return "", err
 	}
 
 	api.filtersMu.Lock()
-	api.filters[logsSub.ID] = &filter{typ: LogsSubscription, crit: crit, deadline: time.NewTimer(deadline), logs: make([]*types.Log, 0), s: logsSub}
+	api.filters[logsSub.ID] = &filter{typ: LogsSubscription, crit: crit, deadline: time.NewTimer(api.timeout), logs: make([]*types.Log, 0), s: logsSub}
 	api.filtersMu.Unlock()
 
 	go func() {
@@ -324,28 +329,36 @@ func (api *PublicFilterAPI) NewFilter(crit FilterCriteria) (rpc.ID, error) {
 
 // GetLogs returns logs matching the given argument that are stored within the state.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getlogs
+// https://eth.wiki/json-rpc/API#eth_getlogs
 func (api *PublicFilterAPI) GetLogs(ctx context.Context, crit FilterCriteria) ([]*types.Log, error) {
-	if crit.FromBlock == nil {
-		crit.FromBlock = big.NewInt(rpc.LatestBlockNumber.Int64())
+	var filter *Filter
+	if crit.BlockHash != nil {
+		// Block filter requested, construct a single-shot filter
+		filter = NewBlockFilter(api.backend, *crit.BlockHash, crit.Addresses, crit.Topics)
+	} else {
+		// Convert the RPC block numbers into internal representations
+		begin := rpc.LatestBlockNumber.Int64()
+		if crit.FromBlock != nil {
+			begin = crit.FromBlock.Int64()
+		}
+		end := rpc.LatestBlockNumber.Int64()
+		if crit.ToBlock != nil {
+			end = crit.ToBlock.Int64()
+		}
+		// Construct the range filter
+		filter = NewRangeFilter(api.backend, begin, end, crit.Addresses, crit.Topics)
 	}
-	if crit.ToBlock == nil {
-		crit.ToBlock = big.NewInt(rpc.LatestBlockNumber.Int64())
+	// Run the filter and return all the logs
+	logs, err := filter.Logs(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	filter := New(api.backend, api.useMipMap)
-	filter.SetBeginBlock(crit.FromBlock.Int64())
-	filter.SetEndBlock(crit.ToBlock.Int64())
-	filter.SetAddresses(crit.Addresses)
-	filter.SetTopics(crit.Topics)
-
-	logs, err := filter.Find(ctx)
 	return returnLogs(logs), err
 }
 
 // UninstallFilter removes the filter with the given filter id.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_uninstallfilter
+// https://eth.wiki/json-rpc/API#eth_uninstallfilter
 func (api *PublicFilterAPI) UninstallFilter(id rpc.ID) bool {
 	api.filtersMu.Lock()
 	f, found := api.filters[id]
@@ -363,7 +376,7 @@ func (api *PublicFilterAPI) UninstallFilter(id rpc.ID) bool {
 // GetFilterLogs returns the logs for the filter with the given id.
 // If the filter could not be found an empty array of logs is returned.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getfilterlogs
+// https://eth.wiki/json-rpc/API#eth_getfilterlogs
 func (api *PublicFilterAPI) GetFilterLogs(ctx context.Context, id rpc.ID) ([]*types.Log, error) {
 	api.filtersMu.Lock()
 	f, found := api.filters[id]
@@ -373,21 +386,25 @@ func (api *PublicFilterAPI) GetFilterLogs(ctx context.Context, id rpc.ID) ([]*ty
 		return nil, fmt.Errorf("filter not found")
 	}
 
-	filter := New(api.backend, api.useMipMap)
-	if f.crit.FromBlock != nil {
-		filter.SetBeginBlock(f.crit.FromBlock.Int64())
+	var filter *Filter
+	if f.crit.BlockHash != nil {
+		// Block filter requested, construct a single-shot filter
+		filter = NewBlockFilter(api.backend, *f.crit.BlockHash, f.crit.Addresses, f.crit.Topics)
 	} else {
-		filter.SetBeginBlock(rpc.LatestBlockNumber.Int64())
+		// Convert the RPC block numbers into internal representations
+		begin := rpc.LatestBlockNumber.Int64()
+		if f.crit.FromBlock != nil {
+			begin = f.crit.FromBlock.Int64()
+		}
+		end := rpc.LatestBlockNumber.Int64()
+		if f.crit.ToBlock != nil {
+			end = f.crit.ToBlock.Int64()
+		}
+		// Construct the range filter
+		filter = NewRangeFilter(api.backend, begin, end, f.crit.Addresses, f.crit.Topics)
 	}
-	if f.crit.ToBlock != nil {
-		filter.SetEndBlock(f.crit.ToBlock.Int64())
-	} else {
-		filter.SetEndBlock(rpc.LatestBlockNumber.Int64())
-	}
-	filter.SetAddresses(f.crit.Addresses)
-	filter.SetTopics(f.crit.Topics)
-
-	logs, err := filter.Find(ctx)
+	// Run the filter and return all the logs
+	logs, err := filter.Logs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -395,12 +412,12 @@ func (api *PublicFilterAPI) GetFilterLogs(ctx context.Context, id rpc.ID) ([]*ty
 }
 
 // GetFilterChanges returns the logs for the filter with the given id since
-// last time is was called. This can be used for polling.
+// last time it was called. This can be used for polling.
 //
 // For pending transaction and block filters the result is []common.Hash.
 // (pending)Log filters return []Log.
 //
-// https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getfilterchanges
+// https://eth.wiki/json-rpc/API#eth_getfilterchanges
 func (api *PublicFilterAPI) GetFilterChanges(id rpc.ID) (interface{}, error) {
 	api.filtersMu.Lock()
 	defer api.filtersMu.Unlock()
@@ -411,14 +428,14 @@ func (api *PublicFilterAPI) GetFilterChanges(id rpc.ID) (interface{}, error) {
 			// receive timer value and reset timer
 			<-f.deadline.C
 		}
-		f.deadline.Reset(deadline)
+		f.deadline.Reset(api.timeout)
 
 		switch f.typ {
 		case PendingTransactionsSubscription, BlocksSubscription:
 			hashes := f.hashes
 			f.hashes = nil
 			return returnHashes(hashes), nil
-		case LogsSubscription:
+		case LogsSubscription, MinedAndPendingLogsSubscription:
 			logs := f.logs
 			f.logs = nil
 			return returnLogs(logs), nil
@@ -449,7 +466,8 @@ func returnLogs(logs []*types.Log) []*types.Log {
 // UnmarshalJSON sets *args fields with given data.
 func (args *FilterCriteria) UnmarshalJSON(data []byte) error {
 	type input struct {
-		From      *rpc.BlockNumber `json:"fromBlock"`
+		BlockHash *common.Hash     `json:"blockHash"`
+		FromBlock *rpc.BlockNumber `json:"fromBlock"`
 		ToBlock   *rpc.BlockNumber `json:"toBlock"`
 		Addresses interface{}      `json:"address"`
 		Topics    []interface{}    `json:"topics"`
@@ -460,12 +478,20 @@ func (args *FilterCriteria) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	if raw.From != nil {
-		args.FromBlock = big.NewInt(raw.From.Int64())
-	}
+	if raw.BlockHash != nil {
+		if raw.FromBlock != nil || raw.ToBlock != nil {
+			// BlockHash is mutually exclusive with FromBlock/ToBlock criteria
+			return fmt.Errorf("cannot specify both BlockHash and FromBlock/ToBlock, choose one or the other")
+		}
+		args.BlockHash = raw.BlockHash
+	} else {
+		if raw.FromBlock != nil {
+			args.FromBlock = big.NewInt(raw.FromBlock.Int64())
+		}
 
-	if raw.ToBlock != nil {
-		args.ToBlock = big.NewInt(raw.ToBlock.Int64())
+		if raw.ToBlock != nil {
+			args.ToBlock = big.NewInt(raw.ToBlock.Int64())
+		}
 	}
 
 	args.Addresses = []common.Address{}
@@ -504,7 +530,6 @@ func (args *FilterCriteria) UnmarshalJSON(data []byte) error {
 			switch topic := t.(type) {
 			case nil:
 				// ignore topic when matching logs
-				args.Topics[i] = []common.Hash{{}}
 
 			case string:
 				// match specific topic
@@ -513,12 +538,16 @@ func (args *FilterCriteria) UnmarshalJSON(data []byte) error {
 					return err
 				}
 				args.Topics[i] = []common.Hash{top}
+
 			case []interface{}:
 				// or case e.g. [null, "topic0", "topic1"]
 				for _, rawTopic := range topic {
 					if rawTopic == nil {
-						args.Topics[i] = append(args.Topics[i], common.Hash{})
-					} else if topic, ok := rawTopic.(string); ok {
+						// null component, match all
+						args.Topics[i] = nil
+						break
+					}
+					if topic, ok := rawTopic.(string); ok {
 						parsed, err := decodeTopic(topic)
 						if err != nil {
 							return err
@@ -540,7 +569,7 @@ func (args *FilterCriteria) UnmarshalJSON(data []byte) error {
 func decodeAddress(s string) (common.Address, error) {
 	b, err := hexutil.Decode(s)
 	if err == nil && len(b) != common.AddressLength {
-		err = fmt.Errorf("hex has invalid length %d after decoding", len(b))
+		err = fmt.Errorf("hex has invalid length %d after decoding; expected %d for address", len(b), common.AddressLength)
 	}
 	return common.BytesToAddress(b), err
 }
@@ -548,7 +577,7 @@ func decodeAddress(s string) (common.Address, error) {
 func decodeTopic(s string) (common.Hash, error) {
 	b, err := hexutil.Decode(s)
 	if err == nil && len(b) != common.HashLength {
-		err = fmt.Errorf("hex has invalid length %d after decoding", len(b))
+		err = fmt.Errorf("hex has invalid length %d after decoding; expected %d for topic", len(b), common.HashLength)
 	}
 	return common.BytesToHash(b), err
 }

@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 // Hash represents the 32 byte Keccak256 hash of arbitrary data.
@@ -35,7 +36,7 @@ type Hash struct {
 // NewHashFromBytes converts a slice of bytes to a hash value.
 func NewHashFromBytes(binary []byte) (hash *Hash, _ error) {
 	h := new(Hash)
-	if err := h.SetBytes(binary); err != nil {
+	if err := h.SetBytes(common.CopyBytes(binary)); err != nil {
 		return nil, err
 	}
 	return h, nil
@@ -84,6 +85,11 @@ func (h *Hash) SetHex(hash string) error {
 // GetHex retrieves the hex string representation of the hash.
 func (h *Hash) GetHex() string {
 	return h.hash.Hex()
+}
+
+// String implements Stringer interface for printable representation of the hash.
+func (h *Hash) String() string {
+	return h.GetHex()
 }
 
 // Hashes represents a slice of hashes.
@@ -136,7 +142,7 @@ type Address struct {
 // NewAddressFromBytes converts a slice of bytes to a hash value.
 func NewAddressFromBytes(binary []byte) (address *Address, _ error) {
 	a := new(Address)
-	if err := a.SetBytes(binary); err != nil {
+	if err := a.SetBytes(common.CopyBytes(binary)); err != nil {
 		return nil, err
 	}
 	return a, nil
@@ -187,6 +193,11 @@ func (a *Address) GetHex() string {
 	return a.address.Hex()
 }
 
+// String returns a printable representation of the address.
+func (a *Address) String() string {
+	return a.GetHex()
+}
+
 // Addresses represents a slice of addresses.
 type Addresses struct{ addresses []common.Address }
 
@@ -227,4 +238,14 @@ func (a *Addresses) Set(index int, address *Address) error {
 // Append adds a new address element to the end of the slice.
 func (a *Addresses) Append(address *Address) {
 	a.addresses = append(a.addresses, address.address)
+}
+
+// EncodeToHex encodes b as a hex string with 0x prefix.
+func EncodeToHex(b []byte) string {
+	return hexutil.Encode(b)
+}
+
+// DecodeFromHex decodes a hex string with 0x prefix.
+func DecodeFromHex(s string) ([]byte, error) {
+	return hexutil.Decode(s)
 }
